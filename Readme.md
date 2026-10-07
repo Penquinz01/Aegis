@@ -231,8 +231,10 @@ directly on a resource-constrained embedded node**.
 
 # 8. Communication Technology
 
-The initial prototype can use **Wi-Fi communication between ESP32
-nodes**.
+The initial firmware uses **ESP-NOW over the ESP32 station interface**
+on Wi-Fi channel 6. Nodes broadcast periodic neighbor and route-cost
+beacons, then send bundles directly to discovered peers. This avoids an
+access point for the first five-node testbed.
 
 The communication layer is responsible for:
 
@@ -242,8 +244,14 @@ The communication layer is responsible for:
 - Link monitoring
 - Bundle forwarding
 
-The project deliberately introduces conditions where links may become
-unavailable or unreliable so that the DTN behavior can be evaluated.
+Node images are selected with the PlatformIO environments `node1` to
+`node5`; Node 5 is the default destination. The firmware currently uses
+a RAM-only bounded queue, hop-count routing with RSSI tie-breaking,
+hop-by-hop acknowledgements, and a CRC for accidental corruption. The
+CRC does not provide authentication or encryption. See
+[`docs/QUICKSTART.md`](docs/QUICKSTART.md) for flashing and the serial
+console workflow. Hardware behavior and research metrics still require
+five-device experiments.
 
 ---
 
@@ -1325,19 +1333,18 @@ until validated experimentally.
 
 # 38A. Development Toolchain Summary
 
-The intended development environment is:
+The current PlatformIO environment is pinned to pioarduino platform
+`55.03.312-1`, which packages Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5.
+The project remains on the Arduino framework. Current firmware uses:
 
 ```text
 PlatformIO
    │
-   ├── Arduino-ESP32 core 3.x
-   │       └── ESP-IDF 5.x based
+   ├── Arduino-ESP32 core 3.3.12
+   │       └── ESP-IDF 5.5.5 based
    │
    ├── FreeRTOS
-   ├── ESP-NOW
-   ├── mbedTLS AES-GCM
-   ├── LittleFS
-   └── emlearn
+   └── ESP-NOW (implemented; unencrypted)
           │
           ▼
        Base ESP32
@@ -1345,15 +1352,16 @@ PlatformIO
           ▼
       ESP32-S3 later
 
-Python + SimPy
-   │
-   ├── DTN simulation
-   ├── baseline evaluation
-   ├── dataset generation
-   └── model evaluation
+Future stages (not yet implemented):
+   ├── LittleFS bundle persistence
+   ├── authenticated/encrypted bundles
+   ├── TinyML inference
+   └── Python/SimPy evaluation and dataset tooling
 ```
 
-The repository should pin the exact PlatformIO platform/core versions and record them in `docs/` so that the firmware can be reproduced later.
+The implementation and packet layout are described in
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md). Reproducible setup steps are in
+[`docs/QUICKSTART.md`](docs/QUICKSTART.md).
 
 ---
 
