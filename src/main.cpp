@@ -7,6 +7,11 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+#include <freertos/timers.h>
+
 #include "aegis/BundleQueue.hpp"
 #include "aegis/Config.hpp"
 #include "aegis/EspNowTransport.hpp"
@@ -33,10 +38,19 @@ Counters counters;
 uint64_t recentBundleIds[kRecentBundleCapacity]{};
 size_t recentBundleCursor = 0;
 uint16_t sequence = 0;
-uint32_t lastBeaconMs = 0;
-uint32_t lastStatusMs = 0;
 char serialLine[256]{};
 size_t serialLineLength = 0;
+constexpr uint32_t kNotifyBeacon = 1U << 0U;
+constexpr uint32_t kNotifyForward = 1U << 1U;
+constexpr uint32_t kNotifyStatus = 1U << 2U;
+constexpr UBaseType_t kCommandQueueLength = 4;
+constexpr uint32_t kForwardIntervalMs = 10U;
+
+QueueHandle_t commandQueue = nullptr;
+TaskHandle_t protocolTaskHandle = nullptr;
+TimerHandle_t beaconTimer = nullptr;
+TimerHandle_t forwardTimer = nullptr;
+TimerHandle_t statusTimer = nullptr;
 
 bool wasSeen(uint64_t bundleId) {
     for (uint64_t recentId : recentBundleIds) {
@@ -274,6 +288,10 @@ void printStatus(uint32_t nowMs) {
     }
 }
 
+void runStatus(uint32_t nowMs) {
+    printStatus(nowMs);
+}
+
 bool parsePriority(const char* text, Priority& priority) {
     if (std::strcmp(text, "critical") == 0) {
         priority = Priority::Critical;
@@ -352,28 +370,81 @@ void handleSendCommand(char* command) {
                   static_cast<unsigned>(priority));
 }
 
-void processSerial(uint32_t nowMs) {
-    while (Serial.available() > 0) {
-        const char value = static_cast<char>(Serial.read());
-        if (value == '\r') {
-            continue;
-        }
-        if (value == '\n') {
-            serialLine[serialLineLength] = '\0';
-            if (std::strncmp(serialLine, "send ", 5) == 0) {
-                handleSendCommand(serialLine);
-            } else if (std::strcmp(serialLine, "status") == 0) {
-                printStatus(nowMs);
-            } else if (std::strcmp(serialLine, "help") == 0) {
-                Serial.println(F("commands: status | send <node 1..5> <critical|normal|bulk> <message>"));
-            } else if (serialLineLength > 0) {
-                Serial.println(F("unknown command; type help"));
+void processCommand(const char* line, uint32_t nowMs) {
+    char command[sizeof(serialLine)];
+    std::strncpy(command, line, sizeof(command) - 1U);
+    command[sizeof(command) - 1U] = '\0';
+    if (std::strncmp(command, "send ", 5) == 0) {
+        handleSendCommand(command);
+    } else if (std::strcmp(command, "status") == 0) {
+        printStatus(nowMs);
+    } else if (std::strcmp(command, "help") == 0) {
+        Serial.println(F("commands: status | send <node 1..5> <critical|normal|bulk> <message>"));
+    } else if (command[0] != '\0') {
+        Serial.println(F("unknown command; type help"));
+    }
+}
+
+void serialInputTask(void*) {
+    for (;;) {
+        while (Serial.available() > 0) {
+            const char value = static_cast<char>(Serial.read());
+            if (value == '\r') {
+                continue;
             }
-            serialLineLength = 0;
-            continue;
+            if (value == '\n') {
+                serialLine[serialLineLength] = '\0';
+                if (commandQueue != nullptr && serialLineLength > 0) {
+                    xQueueSend(commandQueue, serialLine, 0);
+                }
+                serialLineLength = 0;
+                continue;
+            }
+            if (serialLineLength + 1 < sizeof(serialLine)) {
+                serialLine[serialLineLength++] = value;
+            }
         }
-        if (serialLineLength + 1 < sizeof(serialLine)) {
-            serialLine[serialLineLength++] = value;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void notifyProtocolTask(TimerHandle_t timer, uint32_t notification) {
+    TaskHandle_t task = static_cast<TaskHandle_t>(pvTimerGetTimerID(timer));
+    if (task != nullptr) {
+        xTaskNotify(task, notification, eSetBits);
+    }
+}
+
+void beaconTimerCallback(TimerHandle_t timer) {
+    notifyProtocolTask(timer, kNotifyBeacon);
+}
+
+void forwardTimerCallback(TimerHandle_t timer) {
+    notifyProtocolTask(timer, kNotifyForward);
+}
+
+void statusTimerCallback(TimerHandle_t timer) {
+    notifyProtocolTask(timer, kNotifyStatus);
+}
+
+void protocolTask(void*) {
+    for (;;) {
+        uint32_t notifications = 0;
+        xTaskNotifyWait(0, UINT32_MAX, &notifications, pdMS_TO_TICKS(10));
+        const uint32_t nowMs = millis();
+        char command[sizeof(serialLine)];
+        while (commandQueue != nullptr && xQueueReceive(commandQueue, command, 0) == pdTRUE) {
+            processCommand(command, nowMs);
+        }
+        processFrames(nowMs);
+        if ((notifications & kNotifyBeacon) != 0U) {
+            sendBeacon(nowMs);
+        }
+        if ((notifications & kNotifyForward) != 0U) {
+            processForwarding(nowMs);
+        }
+        if ((notifications & kNotifyStatus) != 0U) {
+            printStatus(nowMs);
         }
     }
 }
@@ -396,23 +467,28 @@ void setup() {
     Serial.printf("event=ready node=%u mac=%s channel=%u\n", aegis::kNodeId,
                   WiFi.macAddress().c_str(), aegis::kWifiChannel);
     Serial.println(F("commands: status | send <node 1..5> <critical|normal|bulk> <message>"));
+
+    commandQueue = xQueueCreate(kCommandQueueLength, sizeof(serialLine));
+    if (commandQueue == nullptr ||
+        xTaskCreate(protocolTask, "aegis_protocol", 6144, nullptr, 2, &protocolTaskHandle) != pdPASS ||
+        xTaskCreate(serialInputTask, "aegis_serial", 3072, nullptr, 1, nullptr) != pdPASS) {
+        Serial.println(F("event=boot_error reason=freertos_task_setup_failed"));
+        return;
+    }
+
+    beaconTimer = xTimerCreate("aegis_beacon", pdMS_TO_TICKS(aegis::kHeartbeatIntervalMs),
+                               pdTRUE, protocolTaskHandle, beaconTimerCallback);
+    forwardTimer = xTimerCreate("aegis_forward", pdMS_TO_TICKS(kForwardIntervalMs),
+                                pdTRUE, protocolTaskHandle, forwardTimerCallback);
+    statusTimer = xTimerCreate("aegis_status", pdMS_TO_TICKS(10000U),
+                               pdTRUE, protocolTaskHandle, statusTimerCallback);
+    if (beaconTimer == nullptr || forwardTimer == nullptr || statusTimer == nullptr ||
+        xTimerStart(beaconTimer, 0) != pdPASS || xTimerStart(forwardTimer, 0) != pdPASS ||
+        xTimerStart(statusTimer, 0) != pdPASS) {
+        Serial.println(F("event=boot_error reason=freertos_timer_setup_failed"));
+    }
 }
 
 void loop() {
-    const uint32_t nowMs = millis();
-    processSerial(nowMs);
-    processFrames(nowMs);
-
-    if (static_cast<uint32_t>(nowMs - lastBeaconMs) >= aegis::kHeartbeatIntervalMs) {
-        lastBeaconMs = nowMs;
-        sendBeacon(nowMs);
-    }
-
-    processForwarding(nowMs);
-
-    if (static_cast<uint32_t>(nowMs - lastStatusMs) >= 10000U) {
-        lastStatusMs = nowMs;
-        printStatus(nowMs);
-    }
-    delay(1);
+    vTaskDelay(portMAX_DELAY);
 }
