@@ -6,11 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdarg>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
-#include <freertos/timers.h>
 
 #include "aegis/BundleQueue.hpp"
 #include "aegis/Config.hpp"
@@ -33,24 +33,174 @@ struct Counters {
 
 EspNowTransport transport;
 BundleQueue bundleQueue;
-RoutingTable routingTable;
 Counters counters;
 uint64_t recentBundleIds[kRecentBundleCapacity]{};
 size_t recentBundleCursor = 0;
 uint16_t sequence = 0;
 char serialLine[256]{};
 size_t serialLineLength = 0;
-constexpr uint32_t kNotifyBeacon = 1U << 0U;
-constexpr uint32_t kNotifyForward = 1U << 1U;
-constexpr uint32_t kNotifyStatus = 1U << 2U;
-constexpr UBaseType_t kCommandQueueLength = 4;
-constexpr uint32_t kForwardIntervalMs = 10U;
 
-QueueHandle_t commandQueue = nullptr;
-TaskHandle_t protocolTaskHandle = nullptr;
-TimerHandle_t beaconTimer = nullptr;
-TimerHandle_t forwardTimer = nullptr;
-TimerHandle_t statusTimer = nullptr;
+enum class RouteOperation : uint8_t { Update, Cost, NextHop };
+
+struct RouteMessage {
+    RouteOperation operation;
+    uint8_t nodeId;
+    uint8_t destinationId;
+    uint8_t cost;
+    uint8_t bufferPercent;
+    int8_t rssi;
+    uint32_t nowMs;
+    uint32_t visitedMask;
+    uint16_t requestId;
+};
+
+struct RouteResult {
+    uint16_t requestId;
+    uint8_t value;
+};
+
+struct LogRecord {
+    uint16_t length;
+    uint8_t bytes[256];
+};
+
+QueueHandle_t routeQueue = nullptr;
+QueueHandle_t routeResultQueue = nullptr;
+QueueHandle_t logQueue = nullptr;
+uint16_t routeRequestSequence = 0;
+
+void logBytes(const uint8_t* bytes, size_t length) {
+    if (logQueue == nullptr) {
+        Serial.write(bytes, length);
+        return;
+    }
+    LogRecord record{};
+    record.length = static_cast<uint16_t>(length > sizeof(record.bytes) ? sizeof(record.bytes) : length);
+    std::memcpy(record.bytes, bytes, record.length);
+    xQueueSend(logQueue, &record, 0);
+}
+
+void logLine(const char* line) {
+    LogRecord record{};
+    const size_t length = std::strlen(line);
+    const size_t copyLength = length < sizeof(record.bytes) - 1U ? length : sizeof(record.bytes) - 1U;
+    std::memcpy(record.bytes, line, copyLength);
+    record.bytes[copyLength] = '\n';
+    record.length = static_cast<uint16_t>(copyLength + 1U);
+    if (logQueue == nullptr) {
+        Serial.write(record.bytes, record.length);
+    } else {
+        xQueueSend(logQueue, &record, 0);
+    }
+}
+
+void logPrintf(const char* format, ...) {
+    char line[256];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    logLine(line);
+}
+
+void loggerTask(void*) {
+    logPrintf("event=task_start name=host_logger core=%d\n", xPortGetCoreID());
+    LogRecord record;
+    for (;;) {
+        if (xQueueReceive(logQueue, &record, portMAX_DELAY) == pdTRUE) {
+            Serial.write(record.bytes, record.length);
+        }
+    }
+}
+
+void routingTask(void*) {
+    logPrintf("event=task_start name=router core=%d\n", xPortGetCoreID());
+    RoutingTable routingTable;
+    RouteMessage request{};
+    for (;;) {
+        if (xQueueReceive(routeQueue, &request, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (request.operation == RouteOperation::Update) {
+            routingTable.update(request.nodeId, request.destinationId, request.cost,
+                                request.bufferPercent, request.rssi, request.nowMs);
+            continue;
+        }
+        RouteResult result{};
+        result.requestId = request.requestId;
+        result.value = request.operation == RouteOperation::Cost
+                           ? routingTable.costTo(request.destinationId, request.nowMs)
+                           : routingTable.nextHop(request.destinationId, request.visitedMask, request.nowMs);
+        xQueueSend(routeResultQueue, &result, 0);
+    }
+}
+
+uint8_t requestRoute(RouteMessage request) {
+    RouteResult result{};
+    request.requestId = ++routeRequestSequence;
+    if (routeQueue == nullptr || routeResultQueue == nullptr ||
+        xQueueSend(routeQueue, &request, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return 0xFF;
+    }
+    const TickType_t startedAt = xTaskGetTickCount();
+    while (static_cast<TickType_t>(xTaskGetTickCount() - startedAt) < pdMS_TO_TICKS(50)) {
+        if (xQueueReceive(routeResultQueue, &result, pdMS_TO_TICKS(5)) == pdTRUE &&
+            result.requestId == request.requestId) {
+            return result.value;
+        }
+    }
+    return 0xFF;
+}
+
+uint8_t routeCost(uint8_t destinationId, uint32_t nowMs) {
+    return requestRoute(RouteMessage{RouteOperation::Cost, 0, destinationId, 0, 0, 0,
+                                     nowMs, 0, 0});
+}
+
+uint8_t routeNextHop(uint8_t destinationId, uint32_t visitedMask, uint32_t nowMs) {
+    const uint8_t nextHop = requestRoute(RouteMessage{RouteOperation::NextHop, 0, destinationId,
+                                                       0, 0, 0, nowMs, visitedMask, 0});
+    return nextHop == 0xFF ? 0 : nextHop;
+}
+
+using ScheduledFunction = void (*)(uint32_t);
+
+struct ScheduledJob {
+    ScheduledFunction function;
+    uint32_t intervalMs;
+    uint32_t lastRunMs;
+};
+
+void processSerial(uint32_t nowMs);
+void processFrames(uint32_t nowMs);
+void processForwarding(uint32_t nowMs);
+void sendBeacon(uint32_t nowMs);
+void runStatus(uint32_t nowMs);
+
+ScheduledJob scheduledJobs[] = {
+    {processSerial, 1U, 0U},
+    {processFrames, 1U, 0U},
+    {sendBeacon, aegis::kHeartbeatIntervalMs, 0U},
+    {processForwarding, 10U, 0U},
+    {runStatus, 10000U, 0U},
+};
+
+void runScheduledJobs(uint32_t nowMs) {
+    for (ScheduledJob& job : scheduledJobs) {
+        if (static_cast<uint32_t>(nowMs - job.lastRunMs) >= job.intervalMs) {
+            job.lastRunMs = nowMs;
+            job.function(nowMs);
+        }
+    }
+}
+
+void radioBundleTask(void*) {
+    logPrintf("event=task_start name=radio_bundle core=%d\n", xPortGetCoreID());
+    for (;;) {
+        runScheduledJobs(millis());
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
 
 bool wasSeen(uint64_t bundleId) {
     for (uint64_t recentId : recentBundleIds) {
@@ -97,7 +247,7 @@ void sendAck(uint8_t destinationId, uint64_t bundleId) {
     ack.sequence = ++sequence;
     ack.bundleId = bundleId;
     if (!transmit(ack, false, destinationId)) {
-        Serial.printf("event=ack_send_failed node=%u peer=%u bundle=%llu\n",
+        logPrintf("event=ack_send_failed node=%u peer=%u bundle=%llu\n",
                       kNodeId, destinationId, static_cast<unsigned long long>(bundleId));
     }
 }
@@ -110,11 +260,11 @@ void sendBeacon(uint32_t nowMs) {
     beacon.destinationId = kDestinationId;
     beacon.sequence = ++sequence;
     beacon.payloadLength = 3;
-    beacon.payload[0] = routingTable.costTo(kDestinationId, nowMs);
+    beacon.payload[0] = routeCost(kDestinationId, nowMs);
     beacon.payload[1] = bundleQueue.bufferPercent();
     beacon.payload[2] = static_cast<uint8_t>(kQueueCapacity - bundleQueue.size());
     if (!transmit(beacon, true)) {
-        Serial.printf("event=beacon_send_failed node=%u\n", kNodeId);
+        logPrintf("event=beacon_send_failed node=%u\n", kNodeId);
     }
 }
 
@@ -125,11 +275,14 @@ void processBeacon(const Packet& packet, const ReceivedFrame& frame, uint32_t no
         return;
     }
     if (!transport.registerPeer(packet.lastHopId, frame.mac)) {
-        Serial.printf("event=peer_register_failed node=%u peer=%u\n", kNodeId, packet.lastHopId);
+        logPrintf("event=peer_register_failed node=%u peer=%u\n", kNodeId, packet.lastHopId);
         return;
     }
-    routingTable.update(packet.lastHopId, packet.destinationId, packet.payload[0],
-                        packet.payload[1], frame.rssi, nowMs);
+    const RouteMessage update{RouteOperation::Update, packet.lastHopId, packet.destinationId,
+                              packet.payload[0], packet.payload[1], frame.rssi, nowMs, 0, 0};
+    if (routeQueue == nullptr || xQueueSend(routeQueue, &update, 0) != pdTRUE) {
+        logLine("event=route_update_dropped");
+    }
 }
 
 void processAck(const Packet& packet) {
@@ -138,7 +291,7 @@ void processAck(const Packet& packet) {
         return;
     }
     if (bundleQueue.acknowledge(packet.bundleId)) {
-        Serial.printf("event=bundle_acked node=%u bundle=%llu by=%u queue=%u\n",
+        logPrintf("event=bundle_acked node=%u bundle=%llu by=%u queue=%u\n",
                       kNodeId, static_cast<unsigned long long>(packet.bundleId),
                       packet.lastHopId, static_cast<unsigned>(bundleQueue.size()));
     }
@@ -157,18 +310,18 @@ void processBundle(const Packet& packet, uint32_t nowMs) {
     if (packet.destinationId == kNodeId) {
         remember(packet.bundleId);
         ++counters.delivered;
-        Serial.printf("event=bundle_delivered node=%u origin=%u bundle=%llu priority=%u payload=",
+        logPrintf("event=bundle_delivered node=%u origin=%u bundle=%llu priority=%u payload=",
                       kNodeId, packet.originId, static_cast<unsigned long long>(packet.bundleId),
                       static_cast<unsigned>(packet.priority));
-        Serial.write(packet.payload, packet.payloadLength);
-        Serial.println();
+        logBytes(packet.payload, packet.payloadLength);
+        logLine("");
         sendAck(packet.lastHopId, packet.bundleId);
         return;
     }
 
     if (packet.hopLimit == 0 || (packet.visitedMask & nodeMask(kNodeId)) != 0U) {
         ++counters.dropped;
-        Serial.printf("event=bundle_route_rejected node=%u bundle=%llu reason=loop_or_hop_limit\n",
+        logPrintf("event=bundle_route_rejected node=%u bundle=%llu reason=loop_or_hop_limit\n",
                       kNodeId, static_cast<unsigned long long>(packet.bundleId));
         return;
     }
@@ -176,7 +329,7 @@ void processBundle(const Packet& packet, uint32_t nowMs) {
     bool evictedLowerPriority = false;
     uint64_t evictedBundleId = 0;
     if (!bundleQueue.enqueue(packet, nowMs, evictedLowerPriority, evictedBundleId)) {
-        Serial.printf("event=bundle_queue_full node=%u bundle=%llu priority=%u\n",
+        logPrintf("event=bundle_queue_full node=%u bundle=%llu priority=%u\n",
                       kNodeId, static_cast<unsigned long long>(packet.bundleId),
                       static_cast<unsigned>(packet.priority));
         return;
@@ -184,12 +337,12 @@ void processBundle(const Packet& packet, uint32_t nowMs) {
     if (evictedLowerPriority) {
         ++counters.dropped;
         forget(evictedBundleId);
-        Serial.printf("event=low_priority_evicted node=%u queue=%u\n",
+        logPrintf("event=low_priority_evicted node=%u queue=%u\n",
                       kNodeId, static_cast<unsigned>(bundleQueue.size()));
     }
     remember(packet.bundleId);
     sendAck(packet.lastHopId, packet.bundleId);
-    Serial.printf("event=bundle_buffered node=%u bundle=%llu queue=%u\n",
+    logPrintf("event=bundle_buffered node=%u bundle=%llu queue=%u\n",
                   kNodeId, static_cast<unsigned long long>(packet.bundleId),
                   static_cast<unsigned>(bundleQueue.size()));
 }
@@ -236,13 +389,13 @@ void processForwarding(uint32_t nowMs) {
         ++counters.dropped;
         forget(queued.packet.bundleId);
         bundleQueue.acknowledge(queued.packet.bundleId);
-        Serial.printf("event=bundle_expired node=%u bundle=%llu\n",
+        logPrintf("event=bundle_expired node=%u bundle=%llu\n",
                       kNodeId, static_cast<unsigned long long>(queued.packet.bundleId));
         return;
     }
 
-    const uint8_t nextHop = routingTable.nextHop(queued.packet.destinationId,
-                                                  queued.packet.visitedMask | nodeMask(kNodeId), nowMs);
+    const uint8_t nextHop = routeNextHop(queued.packet.destinationId,
+                                         queued.packet.visitedMask | nodeMask(kNodeId), nowMs);
     if (nextHop == 0) {
         bundleQueue.defer(slotIndex, nowMs, 1000);
         return;
@@ -259,7 +412,7 @@ void processForwarding(uint32_t nowMs) {
         if (queued.retryCount > 0) {
             ++counters.retries;
         }
-        Serial.printf("event=bundle_forwarded node=%u next=%u bundle=%llu queue=%u\n",
+        logPrintf("event=bundle_forwarded node=%u next=%u bundle=%llu queue=%u\n",
                       kNodeId, nextHop, static_cast<unsigned long long>(outgoing.bundleId),
                       static_cast<unsigned>(bundleQueue.size()));
     } else {
@@ -268,9 +421,9 @@ void processForwarding(uint32_t nowMs) {
 }
 
 void printStatus(uint32_t nowMs) {
-    Serial.printf("event=status node=%u target=%u queue=%u buffer_pct=%u cost=%u rx=%lu tx=%lu malformed=%lu retries=%lu delivered=%lu dropped=%lu free_heap=%lu\n",
+    logPrintf("event=status node=%u target=%u queue=%u buffer_pct=%u cost=%u rx=%lu tx=%lu malformed=%lu retries=%lu delivered=%lu dropped=%lu free_heap=%lu\n",
                   kNodeId, kDestinationId, static_cast<unsigned>(bundleQueue.size()),
-                  bundleQueue.bufferPercent(), routingTable.costTo(kDestinationId, nowMs),
+                  bundleQueue.bufferPercent(), routeCost(kDestinationId, nowMs),
                   static_cast<unsigned long>(counters.received),
                   static_cast<unsigned long>(counters.transmitted),
                   static_cast<unsigned long>(counters.malformed),
@@ -278,14 +431,6 @@ void printStatus(uint32_t nowMs) {
                   static_cast<unsigned long>(counters.delivered),
                   static_cast<unsigned long>(counters.dropped),
                   static_cast<unsigned long>(ESP.getFreeHeap()));
-    for (uint8_t id = 1; id <= kNodeCount; ++id) {
-        const Neighbor* neighbor = routingTable.neighbor(id, nowMs);
-        if (neighbor != nullptr) {
-            Serial.printf("event=neighbor node=%u peer=%u cost=%u rssi=%d buffer_pct=%u\n",
-                          kNodeId, id, neighbor->costToDestination, neighbor->rssi,
-                          neighbor->bufferPercent);
-        }
-    }
 }
 
 void runStatus(uint32_t nowMs) {
@@ -312,13 +457,13 @@ void handleSendCommand(char* command) {
     char* destinationText = command + 5;
     char* priorityText = std::strchr(destinationText, ' ');
     if (priorityText == nullptr) {
-        Serial.println(F("usage: send <node 1..5> <critical|normal|bulk> <message>"));
+        logLine("usage: send <node 1..5> <critical|normal|bulk> <message>");
         return;
     }
     *priorityText++ = '\0';
     char* payload = std::strchr(priorityText, ' ');
     if (payload == nullptr) {
-        Serial.println(F("usage: send <node 1..5> <critical|normal|bulk> <message>"));
+        logLine("usage: send <node 1..5> <critical|normal|bulk> <message>");
         return;
     }
     *payload++ = '\0';
@@ -328,13 +473,13 @@ void handleSendCommand(char* command) {
     Priority priority;
     if (end == destinationText || *end != '\0' || destination < 1 || destination > kNodeCount ||
         destination == kNodeId || !parsePriority(priorityText, priority) || *payload == '\0') {
-        Serial.println(F("invalid command; use: send <other node 1..5> <critical|normal|bulk> <message>"));
+        logLine("invalid command; use: send <other node 1..5> <critical|normal|bulk> <message>");
         return;
     }
 
     const size_t payloadLength = std::strlen(payload);
     if (payloadLength > kMaximumPayloadBytes) {
-        Serial.printf("error=payload_too_large max=%u\n", static_cast<unsigned>(kMaximumPayloadBytes));
+        logPrintf("error=payload_too_large max=%u\n", static_cast<unsigned>(kMaximumPayloadBytes));
         return;
     }
 
@@ -356,95 +501,42 @@ void handleSendCommand(char* command) {
     bool evictedLowerPriority = false;
     uint64_t evictedBundleId = 0;
     if (!bundleQueue.enqueue(bundle, millis(), evictedLowerPriority, evictedBundleId)) {
-        Serial.println(F("error=queue_full; critical bundles may replace lower priority bundles"));
+        logLine("error=queue_full; critical bundles may replace lower priority bundles");
         return;
     }
     if (evictedLowerPriority) {
         ++counters.dropped;
         forget(evictedBundleId);
-        Serial.printf("event=low_priority_evicted node=%u queue=%u\n",
+        logPrintf("event=low_priority_evicted node=%u queue=%u\n",
                       kNodeId, static_cast<unsigned>(bundleQueue.size()));
     }
-    Serial.printf("event=bundle_created node=%u destination=%u bundle=%llu priority=%u\n",
+    logPrintf("event=bundle_created node=%u destination=%u bundle=%llu priority=%u\n",
                   kNodeId, bundle.destinationId, static_cast<unsigned long long>(bundle.bundleId),
                   static_cast<unsigned>(priority));
 }
 
-void processCommand(const char* line, uint32_t nowMs) {
-    char command[sizeof(serialLine)];
-    std::strncpy(command, line, sizeof(command) - 1U);
-    command[sizeof(command) - 1U] = '\0';
-    if (std::strncmp(command, "send ", 5) == 0) {
-        handleSendCommand(command);
-    } else if (std::strcmp(command, "status") == 0) {
-        printStatus(nowMs);
-    } else if (std::strcmp(command, "help") == 0) {
-        Serial.println(F("commands: status | send <node 1..5> <critical|normal|bulk> <message>"));
-    } else if (command[0] != '\0') {
-        Serial.println(F("unknown command; type help"));
-    }
-}
-
-void serialInputTask(void*) {
-    for (;;) {
-        while (Serial.available() > 0) {
-            const char value = static_cast<char>(Serial.read());
-            if (value == '\r') {
-                continue;
+void processSerial(uint32_t nowMs) {
+    while (Serial.available() > 0) {
+        const char value = static_cast<char>(Serial.read());
+        if (value == '\r') {
+            continue;
+        }
+        if (value == '\n') {
+            serialLine[serialLineLength] = '\0';
+            if (std::strncmp(serialLine, "send ", 5) == 0) {
+                handleSendCommand(serialLine);
+            } else if (std::strcmp(serialLine, "status") == 0) {
+                printStatus(nowMs);
+            } else if (std::strcmp(serialLine, "help") == 0) {
+                logLine("commands: status | send <node 1..5> <critical|normal|bulk> <message>");
+            } else if (serialLineLength > 0) {
+                logLine("unknown command; type help");
             }
-            if (value == '\n') {
-                serialLine[serialLineLength] = '\0';
-                if (commandQueue != nullptr && serialLineLength > 0) {
-                    xQueueSend(commandQueue, serialLine, 0);
-                }
-                serialLineLength = 0;
-                continue;
-            }
-            if (serialLineLength + 1 < sizeof(serialLine)) {
-                serialLine[serialLineLength++] = value;
-            }
+            serialLineLength = 0;
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-}
-
-void notifyProtocolTask(TimerHandle_t timer, uint32_t notification) {
-    TaskHandle_t task = static_cast<TaskHandle_t>(pvTimerGetTimerID(timer));
-    if (task != nullptr) {
-        xTaskNotify(task, notification, eSetBits);
-    }
-}
-
-void beaconTimerCallback(TimerHandle_t timer) {
-    notifyProtocolTask(timer, kNotifyBeacon);
-}
-
-void forwardTimerCallback(TimerHandle_t timer) {
-    notifyProtocolTask(timer, kNotifyForward);
-}
-
-void statusTimerCallback(TimerHandle_t timer) {
-    notifyProtocolTask(timer, kNotifyStatus);
-}
-
-void protocolTask(void*) {
-    for (;;) {
-        uint32_t notifications = 0;
-        xTaskNotifyWait(0, UINT32_MAX, &notifications, pdMS_TO_TICKS(10));
-        const uint32_t nowMs = millis();
-        char command[sizeof(serialLine)];
-        while (commandQueue != nullptr && xQueueReceive(commandQueue, command, 0) == pdTRUE) {
-            processCommand(command, nowMs);
-        }
-        processFrames(nowMs);
-        if ((notifications & kNotifyBeacon) != 0U) {
-            sendBeacon(nowMs);
-        }
-        if ((notifications & kNotifyForward) != 0U) {
-            processForwarding(nowMs);
-        }
-        if ((notifications & kNotifyStatus) != 0U) {
-            printStatus(nowMs);
+        if (serialLineLength + 1 < sizeof(serialLine)) {
+            serialLine[serialLineLength++] = value;
         }
     }
 }
@@ -468,24 +560,23 @@ void setup() {
                   WiFi.macAddress().c_str(), aegis::kWifiChannel);
     Serial.println(F("commands: status | send <node 1..5> <critical|normal|bulk> <message>"));
 
-    commandQueue = xQueueCreate(kCommandQueueLength, sizeof(serialLine));
-    if (commandQueue == nullptr ||
-        xTaskCreate(protocolTask, "aegis_protocol", 6144, nullptr, 2, &protocolTaskHandle) != pdPASS ||
-        xTaskCreate(serialInputTask, "aegis_serial", 3072, nullptr, 1, nullptr) != pdPASS) {
-        Serial.println(F("event=boot_error reason=freertos_task_setup_failed"));
+    logQueue = xQueueCreate(24, sizeof(LogRecord));
+    routeQueue = xQueueCreate(16, sizeof(RouteMessage));
+    routeResultQueue = xQueueCreate(4, sizeof(RouteResult));
+    if (logQueue == nullptr || routeQueue == nullptr || routeResultQueue == nullptr) {
+        Serial.println(F("event=boot_error reason=freertos_queue_setup_failed"));
         return;
     }
 
-    beaconTimer = xTimerCreate("aegis_beacon", pdMS_TO_TICKS(aegis::kHeartbeatIntervalMs),
-                               pdTRUE, protocolTaskHandle, beaconTimerCallback);
-    forwardTimer = xTimerCreate("aegis_forward", pdMS_TO_TICKS(kForwardIntervalMs),
-                                pdTRUE, protocolTaskHandle, forwardTimerCallback);
-    statusTimer = xTimerCreate("aegis_status", pdMS_TO_TICKS(10000U),
-                               pdTRUE, protocolTaskHandle, statusTimerCallback);
-    if (beaconTimer == nullptr || forwardTimer == nullptr || statusTimer == nullptr ||
-        xTimerStart(beaconTimer, 0) != pdPASS || xTimerStart(forwardTimer, 0) != pdPASS ||
-        xTimerStart(statusTimer, 0) != pdPASS) {
-        Serial.println(F("event=boot_error reason=freertos_timer_setup_failed"));
+    const BaseType_t loggerCreated = xTaskCreatePinnedToCore(
+        loggerTask, "aegis_host_logger", 3072, nullptr, 1, nullptr, 1);
+    const BaseType_t routerCreated = xTaskCreatePinnedToCore(
+        routingTask, "aegis_router", 4096, nullptr, 2, nullptr, 1);
+    const BaseType_t radioCreated = xTaskCreatePinnedToCore(
+        radioBundleTask, "aegis_radio_bundle", 6144, nullptr, 3, nullptr, 0);
+    if (loggerCreated != pdPASS || routerCreated != pdPASS || radioCreated != pdPASS) {
+        Serial.println(F("event=boot_error reason=freertos_task_setup_failed"));
+        return;
     }
 }
 
