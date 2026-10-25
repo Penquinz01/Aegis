@@ -35,6 +35,8 @@ Open serial monitors at 115200 baud. The node prints its ID and station MAC at b
 help
 status
 send <node 1..5> <critical|normal|bulk> <message>
+model on|off
+sim rssi <peer 1..5> <-110..-20|auto>
 ```
 
 Example from Node 1:
@@ -44,6 +46,20 @@ send 5 critical evacuation-zone-east
 ```
 
 The message is held in the bounded RAM queue until the next hop acknowledges it. A relay acknowledges only after it has accepted the bundle into its own queue. Node 5 prints the delivery record and acknowledges the final hop. If no route is available, the bundle remains queued until a neighbor advertises a route, the bundle expires, or power is lost.
+
+The default `tiny_linear` route scorer is a compact integer inference baseline using advertised route cost, RSSI, and neighbor buffer occupancy. It favors shorter advertised routes, then stronger signal and more free buffer. It is an initial hand-set model, not a model trained from measured data. Use `model off` to compare with hop-count/RSSI routing; use `model on` to restore it.
+
+To emulate a weak link from this node to a discovered peer, run `sim rssi 2 -95` on that node's serial console. The node substitutes that RSSI in its local routing table while still reporting actual packet reception and radio behavior. Use `sim rssi 2 auto` to return to measured RSSI. This does not create a radio outage or packet loss; it isolates the routing response to a low-signal feature. Use real attenuation or distance changes to measure physical link degradation.
+
+## Live dashboard
+
+Open `dashboard/index.html` from a local web server in Chrome or Edge, for example:
+
+```sh
+python -m http.server 8000
+```
+
+Then visit `http://localhost:8000/dashboard/`. Close any other serial monitor using a board, select **Connect ESP32 serial**, and choose its USB serial port. Repeat for each board. The dashboard shows serial-connected nodes, radio neighbors, and bundle creation, forwarding, delivery, and acknowledgement events. Use **Send a bundle** to choose a connected source node, destination, priority, and message. Browser Web Serial requires a supported browser and a secure context such as localhost.
 
 ## Suggested first run
 

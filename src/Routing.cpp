@@ -45,6 +45,10 @@ uint8_t RoutingTable::costTo(uint8_t destinationId, uint32_t nowMs) const {
         return 0;
     }
 
+    if (neighbor(destinationId, nowMs) != nullptr) {
+        return 1;
+    }
+
     uint8_t best = 0xFF;
     for (const Neighbor& candidate : neighbors_) {
         if (isFresh(candidate, nowMs) && candidate.destinationId == destinationId &&
@@ -57,6 +61,11 @@ uint8_t RoutingTable::costTo(uint8_t destinationId, uint32_t nowMs) const {
 }
 
 uint8_t RoutingTable::nextHop(uint8_t destinationId, uint32_t visitedMask, uint32_t nowMs) const {
+    if (destinationId != kNodeId &&
+        (visitedMask & nodeMask(destinationId)) == 0U && neighbor(destinationId, nowMs) != nullptr) {
+        return destinationId;
+    }
+
     uint8_t bestNode = 0;
     uint8_t bestCost = 0xFF;
     int8_t bestRssi = -127;
@@ -73,6 +82,32 @@ uint8_t RoutingTable::nextHop(uint8_t destinationId, uint32_t visitedMask, uint3
             bestRssi = candidate.rssi;
         }
     }
+    return bestNode;
+}
+
+uint8_t RoutingTable::nextHopTinyMl(uint8_t destinationId, uint32_t visitedMask,
+                                    uint32_t nowMs, int16_t& selectedScore) const {
+    uint8_t bestNode = 0;
+    int16_t bestScore = -32768;
+    for (const Neighbor& candidate : neighbors_) {
+        if (!isFresh(candidate, nowMs) || candidate.destinationId != destinationId ||
+            candidate.costToDestination == 0xFF ||
+            (visitedMask & nodeMask(candidate.nodeId)) != 0U) {
+            continue;
+        }
+
+        // Quantized linear model: favor shorter routes, then stronger links and spare buffer.
+        const int16_t signalFeature = static_cast<int16_t>(candidate.rssi + 100);
+        const int16_t score = static_cast<int16_t>(
+            160 - static_cast<int16_t>(candidate.costToDestination) * 100 +
+            signalFeature * 2 - static_cast<int16_t>(candidate.bufferPercent));
+        if (bestNode == 0 || score > bestScore ||
+            (score == bestScore && candidate.nodeId < bestNode)) {
+            bestNode = candidate.nodeId;
+            bestScore = score;
+        }
+    }
+    selectedScore = bestNode == 0 ? -32768 : bestScore;
     return bestNode;
 }
 

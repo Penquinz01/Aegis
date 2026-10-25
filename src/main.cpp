@@ -40,7 +40,7 @@ uint16_t sequence = 0;
 char serialLine[256]{};
 size_t serialLineLength = 0;
 
-enum class RouteOperation : uint8_t { Update, Cost, NextHop };
+enum class RouteOperation : uint8_t { Update, Cost, NextHop, NextHopTinyMl };
 
 struct RouteMessage {
     RouteOperation operation;
@@ -68,6 +68,8 @@ QueueHandle_t routeQueue = nullptr;
 QueueHandle_t routeResultQueue = nullptr;
 QueueHandle_t logQueue = nullptr;
 uint16_t routeRequestSequence = 0;
+bool tinyMlEnabled = true;
+int8_t simulatedRssi[kNodeCount + 1] = {-128, -128, -128, -128, -128, -128};
 
 void logBytes(const uint8_t* bytes, size_t length) {
     if (logQueue == nullptr) {
@@ -128,9 +130,16 @@ void routingTask(void*) {
         }
         RouteResult result{};
         result.requestId = request.requestId;
-        result.value = request.operation == RouteOperation::Cost
-                           ? routingTable.costTo(request.destinationId, request.nowMs)
-                           : routingTable.nextHop(request.destinationId, request.visitedMask, request.nowMs);
+        if (request.operation == RouteOperation::Cost) {
+            result.value = routingTable.costTo(request.destinationId, request.nowMs);
+        } else if (request.operation == RouteOperation::NextHopTinyMl) {
+            int16_t score = 0;
+            result.value = routingTable.nextHopTinyMl(request.destinationId, request.visitedMask,
+                                                      request.nowMs, score);
+        } else {
+            result.value = routingTable.nextHop(request.destinationId, request.visitedMask,
+                                                request.nowMs);
+        }
         xQueueSend(routeResultQueue, &result, 0);
     }
 }
@@ -158,7 +167,9 @@ uint8_t routeCost(uint8_t destinationId, uint32_t nowMs) {
 }
 
 uint8_t routeNextHop(uint8_t destinationId, uint32_t visitedMask, uint32_t nowMs) {
-    const uint8_t nextHop = requestRoute(RouteMessage{RouteOperation::NextHop, 0, destinationId,
+    const RouteOperation operation = tinyMlEnabled ? RouteOperation::NextHopTinyMl
+                                                    : RouteOperation::NextHop;
+    const uint8_t nextHop = requestRoute(RouteMessage{operation, 0, destinationId,
                                                        0, 0, 0, nowMs, visitedMask, 0});
     return nextHop == 0xFF ? 0 : nextHop;
 }
@@ -278,11 +289,18 @@ void processBeacon(const Packet& packet, const ReceivedFrame& frame, uint32_t no
         logPrintf("event=peer_register_failed node=%u peer=%u\n", kNodeId, packet.lastHopId);
         return;
     }
+    const int8_t effectiveRssi = simulatedRssi[packet.lastHopId] == -128
+                                     ? frame.rssi
+                                     : simulatedRssi[packet.lastHopId];
     const RouteMessage update{RouteOperation::Update, packet.lastHopId, packet.destinationId,
-                              packet.payload[0], packet.payload[1], frame.rssi, nowMs, 0, 0};
+                              packet.payload[0], packet.payload[1], effectiveRssi, nowMs, 0, 0};
     if (routeQueue == nullptr || xQueueSend(routeQueue, &update, 0) != pdTRUE) {
         logLine("event=route_update_dropped");
+        return;
     }
+    logPrintf("event=neighbor node=%u peer=%u rssi=%d cost=%u buffer_pct=%u\n",
+              kNodeId, packet.lastHopId, static_cast<int>(effectiveRssi), packet.payload[0],
+              packet.payload[1]);
 }
 
 void processAck(const Packet& packet) {
@@ -421,9 +439,10 @@ void processForwarding(uint32_t nowMs) {
 }
 
 void printStatus(uint32_t nowMs) {
-    logPrintf("event=status node=%u target=%u queue=%u buffer_pct=%u cost=%u rx=%lu tx=%lu malformed=%lu retries=%lu delivered=%lu dropped=%lu free_heap=%lu\n",
+    logPrintf("event=status node=%u target=%u queue=%u buffer_pct=%u cost=%u model=%s rx=%lu tx=%lu malformed=%lu retries=%lu delivered=%lu dropped=%lu free_heap=%lu\n",
                   kNodeId, kDestinationId, static_cast<unsigned>(bundleQueue.size()),
                   bundleQueue.bufferPercent(), routeCost(kDestinationId, nowMs),
+                  tinyMlEnabled ? "tiny_linear" : "baseline",
                   static_cast<unsigned long>(counters.received),
                   static_cast<unsigned long>(counters.transmitted),
                   static_cast<unsigned long>(counters.malformed),
@@ -515,6 +534,35 @@ void handleSendCommand(char* command) {
                   static_cast<unsigned>(priority));
 }
 
+void handleSimulationCommand(char* command) {
+    char* peerText = command + 9;
+    char* valueText = std::strchr(peerText, ' ');
+    if (valueText == nullptr) {
+        logLine("usage: sim rssi <peer 1..5> <-110..-20|auto>");
+        return;
+    }
+    *valueText++ = '\0';
+    char* end = nullptr;
+    const long peer = std::strtol(peerText, &end, 10);
+    if (end == peerText || *end != '\0' || peer < 1 || peer > kNodeCount || peer == kNodeId) {
+        logLine("error=invalid_peer usage=sim_rssi");
+        return;
+    }
+    if (std::strcmp(valueText, "auto") == 0) {
+        simulatedRssi[peer] = -128;
+        logPrintf("event=sim_rssi node=%u peer=%ld mode=auto\n", kNodeId, peer);
+        return;
+    }
+    end = nullptr;
+    const long value = std::strtol(valueText, &end, 10);
+    if (end == valueText || *end != '\0' || value < -110 || value > -20) {
+        logLine("error=invalid_rssi range=-110..-20");
+        return;
+    }
+    simulatedRssi[peer] = static_cast<int8_t>(value);
+    logPrintf("event=sim_rssi node=%u peer=%ld value=%ld\n", kNodeId, peer, value);
+}
+
 void processSerial(uint32_t nowMs) {
     while (Serial.available() > 0) {
         const char value = static_cast<char>(Serial.read());
@@ -527,8 +575,16 @@ void processSerial(uint32_t nowMs) {
                 handleSendCommand(serialLine);
             } else if (std::strcmp(serialLine, "status") == 0) {
                 printStatus(nowMs);
+            } else if (std::strcmp(serialLine, "model on") == 0) {
+                tinyMlEnabled = true;
+                logLine("event=model mode=tiny_linear");
+            } else if (std::strcmp(serialLine, "model off") == 0) {
+                tinyMlEnabled = false;
+                logLine("event=model mode=baseline");
+            } else if (std::strncmp(serialLine, "sim rssi ", 9) == 0) {
+                handleSimulationCommand(serialLine);
             } else if (std::strcmp(serialLine, "help") == 0) {
-                logLine("commands: status | send <node 1..5> <critical|normal|bulk> <message>");
+                logLine("commands: status | model on|off | sim rssi <peer 1..5> <-110..-20|auto> | send <node 1..5> <critical|normal|bulk> <message>");
             } else if (serialLineLength > 0) {
                 logLine("unknown command; type help");
             }
@@ -558,7 +614,7 @@ void setup() {
     }
     Serial.printf("event=ready node=%u mac=%s channel=%u\n", aegis::kNodeId,
                   WiFi.macAddress().c_str(), aegis::kWifiChannel);
-    Serial.println(F("commands: status | send <node 1..5> <critical|normal|bulk> <message>"));
+    Serial.println(F("commands: status | model on|off | sim rssi <peer 1..5> <-110..-20|auto> | send <node 1..5> <critical|normal|bulk> <message>"));
 
     logQueue = xQueueCreate(24, sizeof(LogRecord));
     routeQueue = xQueueCreate(16, sizeof(RouteMessage));

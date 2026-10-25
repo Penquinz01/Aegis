@@ -20,6 +20,8 @@ public:
                 uint8_t bufferPercent, int8_t rssi, uint32_t nowMs);
     uint8_t costTo(uint8_t destinationId, uint32_t nowMs) const;
     uint8_t nextHop(uint8_t destinationId, uint32_t visitedMask, uint32_t nowMs) const;
+    uint8_t nextHopTinyMl(uint8_t destinationId, uint32_t visitedMask, uint32_t nowMs,
+                          int16_t& selectedScore) const;
     uint8_t freeSlots(uint32_t nowMs) const;
     const Neighbor* neighbor(uint8_t nodeId, uint32_t nowMs) const;
 
