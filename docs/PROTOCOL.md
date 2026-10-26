@@ -9,7 +9,7 @@ All multibyte integer fields are little-endian. Packets are serialized field by 
 | Type | 1 | Beacon `1`, bundle `2`, ACK `3` |
 | Origin ID | 1 | Original node that created the bundle (or sender for control packets) |
 | Last-hop ID | 1 | Node that transmitted this packet directly |
-| Destination ID | 1 | Bundle destination; beacon destination is the advertised route target |
+| Destination ID | 1 | Bundle destination; for a beacon, the route target whose cost is advertised |
 | Priority | 1 | Bulk `0`, normal `1`, critical `2` |
 | Hop limit | 1 | Remaining forwarding budget |
 | Sequence | 2 | Per-node diagnostic/transmission sequence |
@@ -22,8 +22,8 @@ All multibyte integer fields are little-endian. Packets are serialized field by 
 
 ## Type-specific payloads
 
-- **Beacon:** three bytes: advertised hop cost (`255` means unknown), queue usage in percent, and free queue slots. A node refreshes its neighbor entry after every valid beacon and expires neighbors after seven seconds.
-- **Bundle:** application bytes. A relay stores the packet before returning a hop acknowledgement. Forwarding chooses a live neighbor advertising the same destination with the lowest hop cost, using stronger RSSI to break ties and excluding nodes already in the visited mask.
+- **Beacon:** three bytes: advertised hop cost to the destination ID in the header (`255` means unknown), queue usage in percent, and free queue slots. Each node cycles through destination IDs 1–5, sending one beacon every 400 ms. This refreshes each destination route every two seconds. Neighbors expire after seven seconds; individual destination advertisements also expire after seven seconds.
+- **Bundle:** application bytes. A relay stores the packet before returning a hop acknowledgement. Forwarding chooses the strongest-RSSI live, unvisited neighbor with a route to the bundle destination. Route cost and buffer occupancy break exact RSSI ties. At the source, the destination is excluded from the first-hop candidates so a reachable relay is used before the destination.
 - **ACK:** no payload. The bundle ID identifies the bundle acknowledged; destination ID is the preceding hop.
 
 The CRC is not a security mechanism. The initial firmware does not configure ESP-NOW peer keys, authenticate beacon identities, encrypt bundles, or persist bundles. Those require a defined provisioning and threat model before production use.

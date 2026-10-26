@@ -41,6 +41,11 @@
     <section class="panel"><h3>Data sharing</h3><div class="list" id="traffic"></div></section>
   </div>
   <section class="panel" style="margin-top:12px">
+    <h3>Next-hop trace</h3>
+    <div class="muted">Events with the same bundle ID are grouped into a hop path. Connect each node’s serial stream to see the complete route.</div>
+    <div class="list" id="hopTraces"></div>
+  </section>
+  <section class="panel" style="margin-top:12px">
     <h3>Send a bundle</h3>
     <form id="sendForm" class="toolbar">
       <label>From <select id="source" required></select></label>
@@ -54,15 +59,147 @@
   <section class="panel" style="margin-top:12px"><h3>Recent serial events</h3><div class="list" id="events"></div></section>
 <script>
 (() => {
-  const nodes = new Map(), links = new Map(), events = [], traffic = [], connections = new Map();
+  const nodes = new Map(), links = new Map(), events = [], traffic = [], hopTraces = new Map(), connections = new Map();
   const nodeBox = document.querySelector('#nodes'), linkBox = document.querySelector('#links');
   const trafficBox = document.querySelector('#traffic'), eventBox = document.querySelector('#events');
+  const hopTraceBox = document.querySelector('#hopTraces');
   const support = document.querySelector('#support');
+  const sendStatus = document.querySelector('#sendStatus');
+  let sendStatusText = '';
+  let pendingSend = null;
+  let trackedSendBundle = '';
   const now = () => Date.now();
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  support.textContent = 'Connect each board once and allow the browser to access its serial port. Use Chrome or Edge on localhost; each USB serial monitor must be closed before connecting here. Nodes are online while their serial stream is alive; radio links expire after 6 seconds without a beacon.';
-  function eventLine(line) {
+  function latestLinkRssi(from, to) {
+    const candidates = [...links.values()].filter(link => link.from === from && link.to === to);
+    candidates.sort((a,b)=>b.lastSeen-a.lastSeen);
+    return candidates[0]?.rssi;
+  }
+  support.textContent = 'Connect each board once and allow the browser to access its serial port. Use Chrome or Edge on localhost; each USB serial monitor must be closed before connecting here. Nodes are online while their serial stream is alive; route advertisements cover destinations 1–5 and radio links expire after 6 seconds without a beacon.';
+  function setSendStatus(message, tone='muted') {
+    sendStatusText = message;
+    sendStatus.textContent = message;
+    sendStatus.className = tone;
+  }
+  function refreshSendControls() {
+    const available = [...nodes.values()].filter(n=>n.connection?.write);
+    const source = Number(document.querySelector('#source').value);
+    const destination = Number(document.querySelector('#destination').value);
+    const hasDifferentDestination = [...nodes.keys()].some(id=>id!==source);
+    const message = document.querySelector('#message').value.trim();
+    document.querySelector('#sendButton').disabled = !available.length || !hasDifferentDestination || !message || !!pendingSend;
+
+    const defaultStatus = !sendStatusText || sendStatusText.startsWith('Connect a board') ||
+      sendStatusText.startsWith('Connect another node') || sendStatusText.startsWith('Enter a message') ||
+      sendStatusText.startsWith('Ready to send');
+    if (pendingSend) {
+      setSendStatus(`Waiting for Node ${pendingSend.source} to accept the command…`);
+    } else if (!available.length) {
+      setSendStatus('Connect a board to enable sending.');
+    } else if (!hasDifferentDestination || source===destination) {
+      setSendStatus('Connect another node or wait for a radio neighbor before sending.');
+    } else if (defaultStatus) {
+      setSendStatus(message ? 'Ready to send. The firmware will route through the strongest-RSSI next hop.' : 'Enter a message to enable sending.');
+    }
+  }
+  function handleSendResponse(line, fields, connection) {
+    if (pendingSend?.connection === connection) {
+      const isAccepted = fields.event === 'bundle_created' &&
+        Number(fields.node) === pendingSend.source && Number(fields.destination) === pendingSend.destination;
+      if (isAccepted) {
+        clearTimeout(pendingSend.timeoutId);
+        trackedSendBundle = fields.bundle || '';
+        const source = pendingSend.source;
+        pendingSend = null;
+        setSendStatus(`Node ${source} accepted bundle ${trackedSendBundle}; waiting for hop activity.`, 'good');
+        refreshSendControls();
+        return;
+      }
+      if (/^(?:invalid command|usage: send\b|error=(?:queue_full|payload_too_large)\b|queue full\b)/i.test(line)) {
+        clearTimeout(pendingSend.timeoutId);
+        pendingSend = null;
+        setSendStatus(`Node ${Number(fields.node) || 'firmware'} rejected the send: ${line}`, 'bad');
+        refreshSendControls();
+        return;
+      }
+    }
+
+    if (!trackedSendBundle || fields.bundle !== trackedSendBundle) return;
+    if (fields.event === 'bundle_waiting_route') {
+      setSendStatus(`Bundle ${trackedSendBundle} is queued at Node ${fields.node}, waiting for a route to Node ${fields.destination}.`);
+    } else if (fields.event === 'bundle_forwarded') {
+      setSendStatus(`Bundle ${trackedSendBundle} forwarded from Node ${fields.node} to Node ${fields.next}.`, 'good');
+    } else if (fields.event === 'bundle_send_failed') {
+      setSendStatus(`Bundle ${trackedSendBundle} could not send from Node ${fields.node} to Node ${fields.next}.`, 'bad');
+    } else if (fields.event === 'bundle_delivered') {
+      setSendStatus(`Bundle ${trackedSendBundle} delivered to Node ${fields.node}.`, 'good');
+    } else if (fields.event === 'bundle_expired' || fields.event === 'bundle_route_rejected' || fields.event === 'bundle_queue_full') {
+      setSendStatus(`Bundle ${trackedSendBundle} stopped at Node ${fields.node}: ${fields.event.replace('bundle_', '').replaceAll('_', ' ')}.`, 'bad');
+    }
+  }
+  function updateHopTrace(fields, stamp) {
+    const bundle = fields.bundle;
+    if (!bundle) return;
+    const event = fields.event;
+    let trace = hopTraces.get(bundle);
+    if (!trace) {
+      const source = Number(fields.origin || fields.node) || 0;
+      trace = {bundle, source, destination:Number(fields.destination) || 0, path:source ? [source] : [], edges:[], state:'Observed', updatedAt:stamp};
+    }
+    if (trace.state.startsWith('Delivered to Node ') && event !== 'bundle_delivered') return;
+    if (event === 'bundle_created') {
+      trace.source = Number(fields.node) || trace.source;
+      trace.destination = Number(fields.destination) || trace.destination;
+      trace.path = trace.source ? [trace.source] : trace.path;
+      trace.state = 'Queued at source';
+    } else if (event === 'bundle_forwarded') {
+      const from = Number(fields.node), to = Number(fields.next);
+      if (from && to) {
+        trace.source = trace.source || from;
+        const edge = trace.edges.find(item => item.from === from && item.to === to);
+        if (edge) {
+          edge.attempts += 1;
+          edge.updatedAt = stamp;
+          edge.rssi = latestLinkRssi(from, to);
+        } else {
+          trace.edges.push({from,to,attempts:1,updatedAt:stamp,rssi:latestLinkRssi(from, to)});
+          const previous = trace.path.lastIndexOf(from);
+          trace.path = previous >= 0 ? trace.path.slice(0, previous + 1) : [...trace.path, from];
+          if (trace.path[trace.path.length - 1] !== to) trace.path.push(to);
+        }
+        trace.state = `Forwarded from Node ${from} to Node ${to}`;
+      }
+    } else if (event === 'bundle_buffered') {
+      trace.state = `Stored at Node ${fields.node}`;
+    } else if (event === 'bundle_waiting_route') {
+      trace.destination = Number(fields.destination) || trace.destination;
+      trace.state = `Waiting for a route at Node ${fields.node}`;
+    } else if (event === 'bundle_send_failed') {
+      trace.state = `Send failed from Node ${fields.node} toward Node ${fields.next}`;
+    } else if (event === 'bundle_acked') {
+      trace.state = `Hop acknowledged by Node ${fields.by}`;
+    } else if (event === 'bundle_delivered') {
+      const destination = Number(fields.node) || trace.destination;
+      trace.destination = destination;
+      if (!trace.source) trace.source = Number(fields.origin) || 0;
+      if (!trace.path.length && trace.source) trace.path.push(trace.source);
+      if (destination && trace.path[trace.path.length - 1] !== destination) trace.path.push(destination);
+      trace.state = `Delivered to Node ${destination}`;
+    } else if (event === 'bundle_expired') {
+      trace.state = `Expired at Node ${fields.node}`;
+    } else if (event === 'bundle_route_rejected') {
+      trace.state = `Route rejected at Node ${fields.node}`;
+    } else if (event === 'bundle_queue_full') {
+      trace.state = `Queue full at Node ${fields.node}`;
+    }
+    trace.updatedAt = stamp;
+    hopTraces.delete(bundle);
+    hopTraces.set(bundle, trace);
+    while (hopTraces.size > 50) hopTraces.delete(hopTraces.keys().next().value);
+  }
+  function eventLine(line, connection) {
     const fields = Object.fromEntries([...line.matchAll(/(?:^|\s)([a-z_]+)=([^\s]*)/g)].map(m => [m[1], m[2]]));
+    handleSendResponse(line, fields, connection);
     if (!fields.event) return;
     const stamp = now();
     if (fields.event === 'boot' || fields.event === 'ready') {
@@ -70,16 +207,20 @@
       if (id) nodes.set(id, {...nodes.get(id), id, lastSeen:stamp, mac:fields.mac || nodes.get(id)?.mac, port:true});
     }
     if (fields.node && nodes.has(Number(fields.node))) nodes.get(Number(fields.node)).lastSeen = stamp;
+    if (['bundle_created','bundle_waiting_route','bundle_send_failed','bundle_buffered','bundle_forwarded','bundle_delivered','bundle_acked','bundle_expired','bundle_route_rejected','bundle_queue_full'].includes(fields.event)) {
+      updateHopTrace(fields, stamp);
+    }
     if (fields.event === 'neighbor') {
       const from = Number(fields.node), to = Number(fields.peer);
+      const destination = Number(fields.destination || 5);
       if (from && to) {
-        const key = `${from}-${to}`;
-        links.set(key, {from,to,rssi:fields.rssi,cost:fields.cost,lastSeen:stamp});
+        const key = `${from}-${to}-${destination}`;
+        links.set(key, {from,to,destination,rssi:fields.rssi,cost:fields.cost,lastSeen:stamp});
         if (!nodes.has(from)) nodes.set(from,{id:from,lastSeen:stamp,port:false});
         if (!nodes.has(to)) nodes.set(to,{id:to,lastSeen:stamp,port:false});
       }
     }
-    if (['bundle_created','bundle_buffered','bundle_forwarded','bundle_delivered','bundle_acked'].includes(fields.event)) {
+    if (['bundle_created','bundle_waiting_route','bundle_send_failed','bundle_buffered','bundle_forwarded','bundle_delivered','bundle_acked','bundle_expired','bundle_route_rejected','bundle_queue_full'].includes(fields.event)) {
       traffic.unshift({time:new Date(stamp).toLocaleTimeString(), event:fields.event, node:fields.node, peer:fields.next || fields.by || '', bundle:fields.bundle || '', payload:fields.payload || ''});
       traffic.splice(50);
     }
@@ -89,22 +230,35 @@
   function render() {
     nodeBox.innerHTML = [...nodes.values()].sort((a,b)=>a.id-b.id).map(n => {
       const online = n.port && now()-n.lastSeen < 8000;
-      const outgoing = [...links.values()].filter(l=>l.from===n.id && now()-l.lastSeen<6000).length;
+      const outgoing = new Set([...links.values()].filter(l=>l.from===n.id && now()-l.lastSeen<6000).map(l=>l.to)).size;
       return `<article class="card"><h2>Node ${n.id}<span class="muted">${n.mac ? esc(n.mac) : ''}</span></h2><div><i class="dot ${online?'on':''}"></i><span class="${online?'good':'muted'}">${online?'Serial connected':'Radio seen'}</span></div><div class="muted">${outgoing} neighbor${outgoing===1?'':'s'} heard</div></article>`;
     }).join('') || '<div class="empty">Connect a board to see nodes.</div>';
     const active = [...links.values()].filter(l=>now()-l.lastSeen<6000).sort((a,b)=>a.from-b.from||a.to-b.to);
-    linkBox.innerHTML = active.map(l=>`<div class="row"><span class="good">Node ${l.from} → Node ${l.to}</span><div class="muted">Node ${l.from} hears Node ${l.to} · RSSI ${esc(l.rssi)} dBm · route cost ${esc(l.cost)}</div></div>`).join('') || '<div class="empty">No neighbor beacons yet. Connect boards with Aegis firmware and wait a few seconds.</div>';
+    linkBox.innerHTML = active.map(l=>`<div class="row"><span class="good">Node ${l.from} → Node ${l.to}</span><div class="muted">Node ${l.from} hears Node ${l.to} · RSSI ${esc(l.rssi)} dBm · route to Node ${l.destination}: ${esc(l.cost)} hops</div></div>`).join('') || '<div class="empty">No neighbor beacons yet. Connect boards with Aegis firmware and wait a few seconds.</div>';
     trafficBox.innerHTML = traffic.map(t=>`<div class="row"><strong>${esc(t.event.replace('bundle_','').replaceAll('_',' '))}</strong> · ${esc(t.time)}<div class="muted">Node ${esc(t.node)}${t.peer?` → Node ${esc(t.peer)}`:''} · bundle ${esc(t.bundle)}</div>${t.payload?`<div>${esc(t.payload)}</div>`:''}</div>`).join('') || '<div class="empty">No bundle activity yet. Send a message with: send 5 normal hello</div>';
+    hopTraceBox.innerHTML = [...hopTraces.values()].sort((a,b)=>b.updatedAt-a.updatedAt).map(trace => {
+      const path = trace.path.length ? trace.path.map(id=>`Node ${id}`).join(' → ') : 'Path not observed yet';
+      const retries = trace.edges.filter(edge=>edge.attempts>1).map(edge=>`${edge.from}→${edge.to} (${edge.attempts} sends)`).join(', ');
+      const linkRssi = trace.edges.map(edge=>`Node ${edge.from}→${edge.to}: ${edge.rssi ?? 'RSSI unavailable'}${edge.rssi !== undefined && edge.rssi !== '' ? ' dBm' : ''}`).join(' · ');
+      const destination = trace.destination ? ` · destination Node ${trace.destination}` : '';
+      const hopCount = trace.edges.length;
+      return `<div class="row"><strong>${esc(path)}</strong><div class="muted">Bundle ${esc(trace.bundle)}${destination} · ${hopCount} hop${hopCount===1?'':'s'} · ${esc(trace.state)} · ${new Date(trace.updatedAt).toLocaleTimeString()}</div>${linkRssi?`<div class="muted">${esc(linkRssi)}</div>`:''}${retries?`<div class="muted">Repeated sends: ${esc(retries)}</div>`:''}</div>`;
+    }).join('') || '<div class="empty">No bundle routes observed yet. Send a bundle and follow its bundle ID here.</div>';
     eventBox.innerHTML = events.map(esc).join('<br>') || '<div class="empty">Serial events will appear here.</div>';
     const available = [...nodes.values()].filter(n=>n.connection?.write).sort((a,b)=>a.id-b.id);
     const sourceSelect = document.querySelector('#source'), destinationSelect = document.querySelector('#destination');
     const oldSource = sourceSelect.value, oldDestination = destinationSelect.value;
     sourceSelect.innerHTML = available.map(n=>`<option value="${n.id}">Node ${n.id}</option>`).join('');
-    destinationSelect.innerHTML = [...nodes.keys()].sort((a,b)=>a-b).map(id=>`<option value="${id}">Node ${id}</option>`).join('');
+    const destinations = [...nodes.keys()].sort((a,b)=>a-b);
+    destinationSelect.innerHTML = destinations.map(id=>`<option value="${id}">Node ${id}</option>`).join('');
     if (available.some(n=>String(n.id)===oldSource)) sourceSelect.value=oldSource;
-    if ([...nodes.keys()].some(id=>String(id)===oldDestination)) destinationSelect.value=oldDestination;
-    document.querySelector('#sendButton').disabled = available.length===0;
-    document.querySelector('#sendStatus').textContent = available.length ? 'Choose a connected source node, destination, priority, and message.' : 'Connect a board to enable sending.';
+    if (destinations.some(id=>String(id)===oldDestination) && Number(oldDestination)!==Number(sourceSelect.value)) {
+      destinationSelect.value=oldDestination;
+    } else {
+      const alternative = destinations.find(id=>id!==Number(sourceSelect.value));
+      destinationSelect.value = alternative === undefined ? '' : String(alternative);
+    }
+    refreshSendControls();
   }
   document.querySelector('#connect').addEventListener('click', async () => {
     if (!('serial' in navigator)) { alert('Web Serial is unavailable. Open this page in Chrome or Edge on localhost.'); return; }
@@ -127,7 +281,7 @@
             nodes.set(id,{...nodes.get(id),id,lastSeen:now(),mac:line.match(/\bmac=([^\s]+)/)?.[1]||nodes.get(id)?.mac,port:true,connection});
             render();
           }
-          eventLine(line.trim());
+          eventLine(line.trim(), connection);
         }
       }
       await reader.releaseLock();
@@ -147,16 +301,52 @@
     event.preventDefault();
     const source=Number(document.querySelector('#source').value), destination=Number(document.querySelector('#destination').value);
     const priority=document.querySelector('#priority').value, message=document.querySelector('#message').value.trim();
-    const node=nodes.get(source), status=document.querySelector('#sendStatus');
-    if (!node?.connection?.write) { status.textContent='Connect the selected source board first.'; return; }
-    if (!message || source===destination) { status.textContent='Choose a different destination and enter a message.'; return; }
+    const node=nodes.get(source);
+    if (!node?.connection?.write) { setSendStatus('Connect the selected source board first.', 'bad'); return; }
+    if (!message || source===destination) { setSendStatus('Choose a different destination and enter a message.', 'bad'); return; }
+    if (pendingSend) return;
+    pendingSend = {source, destination, connection:node.connection, timeoutId:null};
+    setSendStatus(`Sending command to Node ${source}…`);
+    refreshSendControls();
     try {
       await node.connection.write(`send ${destination} ${priority} ${message}\n`);
-      status.textContent=`Sent command to Node ${source}. Watch Data sharing and Recent serial events for progress.`;
       document.querySelector('#message').value='';
-    } catch (error) { status.textContent=`Could not send: ${error.message}`; }
+      if (pendingSend?.connection === node.connection) {
+        setSendStatus(`Command reached Node ${source}; waiting for firmware confirmation…`);
+        pendingSend.timeoutId = setTimeout(() => {
+          if (pendingSend?.connection !== node.connection) return;
+          pendingSend = null;
+          setSendStatus(`No response from Node ${source}. Check the selected board and make sure no other serial monitor has its port open.`, 'bad');
+          refreshSendControls();
+        }, 3000);
+      }
+    } catch (error) {
+      if (pendingSend?.connection === node.connection) {
+        clearTimeout(pendingSend.timeoutId);
+        pendingSend = null;
+      }
+      setSendStatus(`Could not send to Node ${source}: ${error.message}`, 'bad');
+      refreshSendControls();
+    }
   });
-  document.querySelector('#clear').addEventListener('click',()=>{events.length=0;traffic.length=0;render();});
+  function resetSendStatus() {
+    if (pendingSend) return;
+    trackedSendBundle = '';
+    setSendStatus('');
+    refreshSendControls();
+  }
+  document.querySelector('#source').addEventListener('change', () => {
+    const source = Number(document.querySelector('#source').value);
+    const destinationSelect = document.querySelector('#destination');
+    if (Number(destinationSelect.value) === source) {
+      const alternative = [...nodes.keys()].sort((a,b)=>a-b).find(id=>id!==source);
+      destinationSelect.value = alternative === undefined ? '' : String(alternative);
+    }
+    resetSendStatus();
+  });
+  document.querySelector('#destination').addEventListener('change', resetSendStatus);
+  document.querySelector('#message').addEventListener('input', resetSendStatus);
+  document.querySelector('#clear').addEventListener('click',()=>{events.length=0;traffic.length=0;hopTraces.clear();render();});
   setInterval(render,1000); render();
 })();
 </script>

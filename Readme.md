@@ -245,10 +245,14 @@ The communication layer is responsible for:
 - Bundle forwarding
 
 Node images are selected with the PlatformIO environments `node1` to
-`node5`; Node 5 is the default destination. The firmware currently uses
-a RAM-only bounded queue, hop-count routing with RSSI tie-breaking,
-hop-by-hop acknowledgements, and a CRC for accidental corruption. The
-CRC does not provide authentication or encryption. See
+`node5`; every node advertises route costs to all five node IDs, allowing
+any powered-on node to be selected as a destination. Node 5 remains the
+default example destination, and a smaller set of uniquely identified
+boards can exercise routes among the nodes that are present. The firmware
+uses a RAM-only bounded queue, strongest-RSSI next-hop selection with
+destination-aware relay forwarding, hop-by-hop acknowledgements, and a CRC
+for accidental corruption. The CRC does not provide authentication or
+encryption. See
 [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for flashing and the serial
 console workflow. Hardware behavior and research metrics still require
 five-device experiments.

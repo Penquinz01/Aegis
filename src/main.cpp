@@ -37,6 +37,7 @@ Counters counters;
 uint64_t recentBundleIds[kRecentBundleCapacity]{};
 size_t recentBundleCursor = 0;
 uint16_t sequence = 0;
+uint8_t beaconDestinationId = 1;
 char serialLine[256]{};
 size_t serialLineLength = 0;
 
@@ -52,6 +53,7 @@ struct RouteMessage {
     uint32_t nowMs;
     uint32_t visitedMask;
     uint16_t requestId;
+    bool requireRelay;
 };
 
 struct RouteResult {
@@ -135,10 +137,10 @@ void routingTask(void*) {
         } else if (request.operation == RouteOperation::NextHopTinyMl) {
             int16_t score = 0;
             result.value = routingTable.nextHopTinyMl(request.destinationId, request.visitedMask,
-                                                      request.nowMs, score);
+                                                      request.nowMs, score, request.requireRelay);
         } else {
             result.value = routingTable.nextHop(request.destinationId, request.visitedMask,
-                                                request.nowMs);
+                                                request.nowMs, request.requireRelay);
         }
         xQueueSend(routeResultQueue, &result, 0);
     }
@@ -163,14 +165,16 @@ uint8_t requestRoute(RouteMessage request) {
 
 uint8_t routeCost(uint8_t destinationId, uint32_t nowMs) {
     return requestRoute(RouteMessage{RouteOperation::Cost, 0, destinationId, 0, 0, 0,
-                                     nowMs, 0, 0});
+                                     nowMs, 0, 0, false});
 }
 
-uint8_t routeNextHop(uint8_t destinationId, uint32_t visitedMask, uint32_t nowMs) {
+uint8_t routeNextHop(uint8_t destinationId, uint32_t visitedMask, uint32_t nowMs,
+                     bool requireRelay) {
     const RouteOperation operation = tinyMlEnabled ? RouteOperation::NextHopTinyMl
                                                     : RouteOperation::NextHop;
-    const uint8_t nextHop = requestRoute(RouteMessage{operation, 0, destinationId,
-                                                       0, 0, 0, nowMs, visitedMask, 0});
+    RouteMessage request{operation, 0, destinationId, 0, 0, 0, nowMs, visitedMask, 0,
+                         requireRelay};
+    const uint8_t nextHop = requestRoute(request);
     return nextHop == 0xFF ? 0 : nextHop;
 }
 
@@ -191,7 +195,7 @@ void runStatus(uint32_t nowMs);
 ScheduledJob scheduledJobs[] = {
     {processSerial, 1U, 0U},
     {processFrames, 1U, 0U},
-    {sendBeacon, aegis::kHeartbeatIntervalMs, 0U},
+    {sendBeacon, aegis::kBeaconIntervalMs, 0U},
     {processForwarding, 10U, 0U},
     {runStatus, 10000U, 0U},
 };
@@ -207,6 +211,13 @@ void runScheduledJobs(uint32_t nowMs) {
 
 void radioBundleTask(void*) {
     logPrintf("event=task_start name=radio_bundle core=%d\n", xPortGetCoreID());
+    const uint32_t startMs = millis();
+    for (ScheduledJob& job : scheduledJobs) {
+        job.lastRunMs = startMs;
+    }
+    const uint32_t beaconPhaseMs =
+        (static_cast<uint32_t>(kNodeId - 1U) * kBeaconIntervalMs) / kNodeCount;
+    scheduledJobs[2].lastRunMs -= beaconPhaseMs;
     for (;;) {
         runScheduledJobs(millis());
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -268,10 +279,13 @@ void sendBeacon(uint32_t nowMs) {
     beacon.type = FrameType::Beacon;
     beacon.originId = kNodeId;
     beacon.lastHopId = kNodeId;
-    beacon.destinationId = kDestinationId;
+    beacon.destinationId = beaconDestinationId;
+    beaconDestinationId = beaconDestinationId >= kNodeCount
+                              ? 1
+                              : static_cast<uint8_t>(beaconDestinationId + 1U);
     beacon.sequence = ++sequence;
     beacon.payloadLength = 3;
-    beacon.payload[0] = routeCost(kDestinationId, nowMs);
+    beacon.payload[0] = routeCost(beacon.destinationId, nowMs);
     beacon.payload[1] = bundleQueue.bufferPercent();
     beacon.payload[2] = static_cast<uint8_t>(kQueueCapacity - bundleQueue.size());
     if (!transmit(beacon, true)) {
@@ -280,8 +294,7 @@ void sendBeacon(uint32_t nowMs) {
 }
 
 void processBeacon(const Packet& packet, const ReceivedFrame& frame, uint32_t nowMs) {
-    if (packet.payloadLength != 3 || packet.originId != packet.lastHopId ||
-        packet.destinationId != kDestinationId) {
+    if (packet.payloadLength != 3 || packet.originId != packet.lastHopId) {
         ++counters.malformed;
         return;
     }
@@ -293,14 +306,15 @@ void processBeacon(const Packet& packet, const ReceivedFrame& frame, uint32_t no
                                      ? frame.rssi
                                      : simulatedRssi[packet.lastHopId];
     const RouteMessage update{RouteOperation::Update, packet.lastHopId, packet.destinationId,
-                              packet.payload[0], packet.payload[1], effectiveRssi, nowMs, 0, 0};
+                              packet.payload[0], packet.payload[1], effectiveRssi, nowMs, 0, 0,
+                              false};
     if (routeQueue == nullptr || xQueueSend(routeQueue, &update, 0) != pdTRUE) {
         logLine("event=route_update_dropped");
         return;
     }
-    logPrintf("event=neighbor node=%u peer=%u rssi=%d cost=%u buffer_pct=%u\n",
-              kNodeId, packet.lastHopId, static_cast<int>(effectiveRssi), packet.payload[0],
-              packet.payload[1]);
+    logPrintf("event=neighbor node=%u peer=%u destination=%u rssi=%d cost=%u buffer_pct=%u\n",
+              kNodeId, packet.lastHopId, packet.destinationId,
+              static_cast<int>(effectiveRssi), packet.payload[0], packet.payload[1]);
 }
 
 void processAck(const Packet& packet) {
@@ -328,8 +342,9 @@ void processBundle(const Packet& packet, uint32_t nowMs) {
     if (packet.destinationId == kNodeId) {
         remember(packet.bundleId);
         ++counters.delivered;
-        logPrintf("event=bundle_delivered node=%u origin=%u bundle=%llu priority=%u payload=",
-                      kNodeId, packet.originId, static_cast<unsigned long long>(packet.bundleId),
+        logPrintf("event=bundle_delivered node=%u origin=%u destination=%u bundle=%llu priority=%u payload=",
+                      kNodeId, packet.originId, packet.destinationId,
+                      static_cast<unsigned long long>(packet.bundleId),
                       static_cast<unsigned>(packet.priority));
         logBytes(packet.payload, packet.payloadLength);
         logLine("");
@@ -360,8 +375,8 @@ void processBundle(const Packet& packet, uint32_t nowMs) {
     }
     remember(packet.bundleId);
     sendAck(packet.lastHopId, packet.bundleId);
-    logPrintf("event=bundle_buffered node=%u bundle=%llu queue=%u\n",
-                  kNodeId, static_cast<unsigned long long>(packet.bundleId),
+    logPrintf("event=bundle_buffered node=%u destination=%u bundle=%llu queue=%u\n",
+                  kNodeId, packet.destinationId, static_cast<unsigned long long>(packet.bundleId),
                   static_cast<unsigned>(bundleQueue.size()));
 }
 
@@ -412,10 +427,16 @@ void processForwarding(uint32_t nowMs) {
         return;
     }
 
+    const bool requireRelay = queued.packet.originId == kNodeId;
     const uint8_t nextHop = routeNextHop(queued.packet.destinationId,
-                                         queued.packet.visitedMask | nodeMask(kNodeId), nowMs);
+                                         queued.packet.visitedMask | nodeMask(kNodeId), nowMs,
+                                         requireRelay);
     if (nextHop == 0) {
         bundleQueue.defer(slotIndex, nowMs, 1000);
+        logPrintf("event=bundle_waiting_route node=%u destination=%u bundle=%llu model=%s\n",
+                  kNodeId, queued.packet.destinationId,
+                  static_cast<unsigned long long>(queued.packet.bundleId),
+                  tinyMlEnabled ? "tiny_rssi_first" : "rssi_first");
         return;
     }
 
@@ -430,19 +451,36 @@ void processForwarding(uint32_t nowMs) {
         if (queued.retryCount > 0) {
             ++counters.retries;
         }
-        logPrintf("event=bundle_forwarded node=%u next=%u bundle=%llu queue=%u\n",
-                      kNodeId, nextHop, static_cast<unsigned long long>(outgoing.bundleId),
+        logPrintf("event=bundle_forwarded node=%u next=%u destination=%u bundle=%llu queue=%u\n",
+                      kNodeId, nextHop, outgoing.destinationId,
+                      static_cast<unsigned long long>(outgoing.bundleId),
                       static_cast<unsigned>(bundleQueue.size()));
     } else {
         bundleQueue.defer(slotIndex, nowMs, 500);
+        logPrintf("event=bundle_send_failed node=%u next=%u destination=%u bundle=%llu\n",
+                  kNodeId, nextHop, outgoing.destinationId,
+                  static_cast<unsigned long long>(outgoing.bundleId));
     }
 }
 
 void printStatus(uint32_t nowMs) {
-    logPrintf("event=status node=%u target=%u queue=%u buffer_pct=%u cost=%u model=%s rx=%lu tx=%lu malformed=%lu retries=%lu delivered=%lu dropped=%lu free_heap=%lu\n",
-                  kNodeId, kDestinationId, static_cast<unsigned>(bundleQueue.size()),
-                  bundleQueue.bufferPercent(), routeCost(kDestinationId, nowMs),
-                  tinyMlEnabled ? "tiny_linear" : "baseline",
+    char routes[40]{};
+    size_t routeLength = 0;
+    for (uint8_t destination = 1; destination <= kNodeCount; ++destination) {
+        const int written = std::snprintf(routes + routeLength, sizeof(routes) - routeLength,
+                                          "%s%u:%u", destination == 1 ? "" : ",",
+                                          static_cast<unsigned>(destination),
+                                          static_cast<unsigned>(routeCost(destination, nowMs)));
+        if (written < 0 || static_cast<size_t>(written) >= sizeof(routes) - routeLength) {
+            break;
+        }
+        routeLength += static_cast<size_t>(written);
+    }
+    logPrintf("event=status node=%u default_target=%u queue=%u buffer_pct=%u default_cost=%u routes=%s model=%s rx=%lu tx=%lu malformed=%lu retries=%lu delivered=%lu dropped=%lu free_heap=%lu\n",
+                  kNodeId, kDefaultDestinationId, static_cast<unsigned>(bundleQueue.size()),
+                  bundleQueue.bufferPercent(), routeCost(kDefaultDestinationId, nowMs),
+                  routes,
+                  tinyMlEnabled ? "tiny_rssi_first" : "rssi_first",
                   static_cast<unsigned long>(counters.received),
                   static_cast<unsigned long>(counters.transmitted),
                   static_cast<unsigned long>(counters.malformed),
@@ -577,7 +615,7 @@ void processSerial(uint32_t nowMs) {
                 printStatus(nowMs);
             } else if (std::strcmp(serialLine, "model on") == 0) {
                 tinyMlEnabled = true;
-                logLine("event=model mode=tiny_linear");
+                logLine("event=model mode=tiny_rssi_first");
             } else if (std::strcmp(serialLine, "model off") == 0) {
                 tinyMlEnabled = false;
                 logLine("event=model mode=baseline");
@@ -606,8 +644,8 @@ void setup() {
         delay(1);
     }
 
-    Serial.printf("event=boot project=Aegis node=%u destination=%u channel=%u framework=Arduino\n",
-                  aegis::kNodeId, aegis::kDestinationId, aegis::kWifiChannel);
+    Serial.printf("event=boot project=Aegis node=%u default_destination=%u channel=%u framework=Arduino\n",
+                  aegis::kNodeId, aegis::kDefaultDestinationId, aegis::kWifiChannel);
     if (!transport.begin(aegis::kWifiChannel)) {
         Serial.println(F("event=boot_error reason=espnow_initialization_failed"));
         return;
