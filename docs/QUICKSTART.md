@@ -45,7 +45,7 @@ Example from Node 1:
 send 5 critical evacuation-zone-east
 ```
 
-Node 5 is only an example destination. For a three-node chain such as Node 1 ↔ Node 2 ↔ Node 3, Node 1 can send through Node 2 to Node 3:
+Node 5 is not required. Any configured node can be a destination, and a directly reachable destination can receive the first hop. For a three-node chain such as Node 1 ↔ Node 2 ↔ Node 3, Node 1 can send through Node 2 to Node 3:
 
 ```text
 send 3 normal hello-through-relay
@@ -53,7 +53,7 @@ send 3 normal hello-through-relay
 
 The message is held in the bounded RAM queue until the next hop acknowledges it. A relay acknowledges only after it has accepted the bundle into its own queue. The destination node prints the delivery record and acknowledges the final hop. If no route is available, the bundle remains queued until a neighbor advertises a route, the bundle expires, or power is lost.
 
-The routing policy chooses the strongest-RSSI eligible neighbor first. The `tiny_rssi_first` mode uses route cost and buffer occupancy only to break exact RSSI ties; `model off` uses route cost and node ID for ties. The current integer tie-breaker is hand-set, not trained from data. At the source, the destination itself is excluded for the first send so a relay is required. This needs at least one reachable relay with a route to the destination; if none is available, the bundle waits instead of taking a direct shortcut. `model on` is the default.
+The routing policy chooses the strongest-RSSI eligible neighbor first. The `tiny_rssi_first` mode uses route cost and buffer occupancy only to break exact RSSI ties; `model off` uses route cost and node ID for ties. The current integer tie-breaker is hand-set, not trained from data. A directly reachable destination is eligible for the first send; otherwise a live relay that advertises a route to it is required. If neither is available, the bundle waits for a route. `model on` is the default.
 
 To emulate a weak link from this node to a discovered peer, run `sim rssi 2 -95` on that node's serial console. The node substitutes that RSSI in its local routing table while still reporting actual packet reception and radio behavior. Use `sim rssi 2 auto` to return to measured RSSI. This does not create a radio outage or packet loss; it isolates the routing response to a low-signal feature. Use real attenuation or distance changes to measure physical link degradation.
 

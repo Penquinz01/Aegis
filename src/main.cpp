@@ -427,7 +427,9 @@ void processForwarding(uint32_t nowMs) {
         return;
     }
 
-    const bool requireRelay = queued.packet.originId == kNodeId;
+    // Direct delivery is valid when the destination is a live neighbor. Relays
+    // are selected only when the destination itself is not reachable.
+    const bool requireRelay = false;
     const uint8_t nextHop = routeNextHop(queued.packet.destinationId,
                                          queued.packet.visitedMask | nodeMask(kNodeId), nowMs,
                                          requireRelay);
